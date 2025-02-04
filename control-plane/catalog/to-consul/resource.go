@@ -934,10 +934,12 @@ func (t *serviceEndpointsResource) Delete(endptKey string, raw interface{}) erro
 	if _, ok := t.Service.endpointSlicesMap[svcKey]; ok {
 		if _, ok := t.Service.endpointSlicesMap[svcKey][endptKey]; ok {
 			delete(t.Service.endpointSlicesMap[svcKey], endptKey)
-			if _, ok := t.Service.consulMap[svcKey]; ok {
+
+			if serviceEndpoints, ok := t.Service.consulMap[svcKey]; ok && len(serviceEndpoints) == 0 {
 				delete(t.Service.consulMap, svcKey)
-				t.Service.sync()
 			}
+
+			t.Service.sync()
 		}
 	}
 
