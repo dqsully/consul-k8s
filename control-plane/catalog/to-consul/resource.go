@@ -935,8 +935,12 @@ func (t *serviceEndpointsResource) Delete(endptKey string, raw interface{}) erro
 		if _, ok := t.Service.endpointSlicesMap[svcKey][endptKey]; ok {
 			delete(t.Service.endpointSlicesMap[svcKey], endptKey)
 
-			if serviceEndpoints, ok := t.Service.consulMap[svcKey]; ok && len(serviceEndpoints) == 0 {
+			if len(t.Service.endpointSlicesMap[svcKey]) == 0 {
+				// Skip generating registrations if this was the last Endpoint
 				delete(t.Service.consulMap, svcKey)
+			} else {
+				// Otherwise, treat this like an upsert of sorts
+				t.Service.generateRegistrations(svcKey)
 			}
 
 			t.Service.sync()
