@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	mapset "github.com/deckarep/golang-set"
 	"github.com/hashicorp/consul-k8s/control-plane/catalog/metrics"
@@ -244,6 +245,22 @@ func (t *ServiceResource) Upsert(key string, raw interface{}) error {
 
 	// If we care about endpoints, we should load the associated endpoint slices.
 	if t.shouldTrackEndpoints(key) {
+		// pt-4: wait for the EndpointSlice informer to finish its initial cache
+		// sync before doing the index lookup. Without this, a Service Upsert that
+		// fires before the EndpointSlice informer has finished its initial LIST
+		// hits an empty informer index, populates endpointSlicesMap[key] with no
+		// entries, leaves consulMap[key] empty, and pushes a partial Sync(rs) to
+		// the Syncer. That partial sync closes initialSyncOnce, starting the
+		// reaper with an incomplete view of desired state, which then schedules
+		// every existing instance of this service in consul for deregister.
+		// The pt-1 switch from a direct paginated K8s API call to the informer
+		// index lookup introduced this dependency on cache-sync ordering between
+		// two independent Controllers; this gate makes the dependency explicit.
+		if !t.waitForEndpointsCacheSync() {
+			// Context cancelled while waiting; controller is shutting down.
+			return nil
+		}
+
 		allEndpointSlices := make(map[string]*discoveryv1.EndpointSlice)
 
 		endpointSliceList, err := t.endpointsController.GetByIndex(endpointServiceIndexName, key)
@@ -319,6 +336,41 @@ func (t *ServiceResource) Run(ch <-chan struct{}) {
 	}
 
 	t.endpointsController.Run(ch)
+}
+
+// waitForEndpointsCacheSync blocks until the EndpointSlice informer's local
+// cache has completed its initial LIST, or the controller's context is
+// cancelled. Returns true on successful sync, false on context cancellation.
+//
+// This is called from Service Upsert before the informer index is queried to
+// build the per-service EndpointSlice set. See pt-4 for why this matters at
+// startup.
+func (t *ServiceResource) waitForEndpointsCacheSync() bool {
+	// In a normal startup, ServiceResource.Run constructs and starts
+	// endpointsController in a Backgrounder goroutine that begins before the
+	// outer Service controller's worker loop is allowed to run. By the time
+	// any Upsert fires, endpointsController is non-nil. The nil check here
+	// guards against an unlikely scheduler race during process boot.
+	if t.endpointsController == nil {
+		select {
+		case <-t.Ctx.Done():
+			return false
+		case <-time.After(100 * time.Millisecond):
+		}
+		if t.endpointsController == nil {
+			t.Log.Warn("endpoints controller not yet initialized; deferring upsert")
+			return false
+		}
+	}
+	if t.endpointsController.HasSynced() {
+		return true
+	}
+	t.Log.Info("waiting for endpoints informer cache to sync before processing service upsert")
+	if !cache.WaitForCacheSync(t.Ctx.Done(), t.endpointsController.HasSynced) {
+		return false
+	}
+	t.Log.Info("endpoints informer cache synced; resuming service upserts")
+	return true
 }
 
 // shouldSync returns true if resyncing should be enabled for the given service.

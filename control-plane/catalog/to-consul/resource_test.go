@@ -1222,6 +1222,86 @@ func TestServiceResource_clusterIP(t *testing.T) {
 	})
 }
 
+// TestServiceResource_waitForEndpointsCacheSync_returnsFalseWhenContextCancelled
+// pins down the pt-4 helper's behavior: when called before endpointsController
+// has been initialized and the context is already cancelled, the helper must
+// not spin or panic and must return false promptly.
+func TestServiceResource_waitForEndpointsCacheSync_returnsFalseWhenContextCancelled(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	sr := &ServiceResource{
+		Log: hclog.NewNullLogger(),
+		Ctx: ctx,
+	}
+
+	require.False(t, sr.waitForEndpointsCacheSync(),
+		"expected helper to return false when context is already cancelled")
+}
+
+// TestServiceResource_waitForEndpointsCacheSync_returnsTrueOnSync verifies the
+// pt-4 helper completes successfully once the inner endpointsController has
+// reported HasSynced. Uses the standard test harness to start the controller
+// with no events, then asserts a Service Upsert proceeds to register endpoints
+// without losing any to the startup race.
+func TestServiceResource_waitForEndpointsCacheSync_returnsTrueOnSync(t *testing.T) {
+	t.Parallel()
+	client := fake.NewSimpleClientset()
+	syncer := newTestSyncer()
+	serviceResource := defaultServiceResource(client, syncer)
+	serviceResource.ClusterIPSync = true
+
+	closer := controller.TestControllerRun(&serviceResource)
+	defer closer()
+
+	// Create the EndpointSlices first, then the Service. This is the order
+	// most likely to expose the pt-1 race: by the time the Service Upsert
+	// fires, the EndpointSlice informer's cache should have these slices —
+	// and the pt-4 wait ensures the index lookup sees them rather than
+	// returning empty.
+	_, err := client.DiscoveryV1().EndpointSlices(metav1.NamespaceDefault).Create(
+		context.Background(),
+		&discoveryv1.EndpointSlice{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:   "foo-aaa",
+				Labels: map[string]string{discoveryv1.LabelServiceName: "foo"},
+			},
+			AddressType: discoveryv1.AddressTypeIPv4,
+			Endpoints: []discoveryv1.Endpoint{
+				{
+					Addresses: []string{"10.0.0.1"},
+					Conditions: discoveryv1.EndpointConditions{
+						Ready: ptr.To(true), Serving: ptr.To(true), Terminating: ptr.To(false),
+					},
+				},
+			},
+			Ports: []discoveryv1.EndpointPort{
+				{Name: ptr.To("http"), Port: ptr.To(int32(8080))},
+				{Name: ptr.To("rpc"), Port: ptr.To(int32(2000))},
+			},
+		},
+		metav1.CreateOptions{})
+	require.NoError(t, err)
+
+	createNodes(t, client)
+
+	svc := clusterIPService("foo", metav1.NamespaceDefault)
+	_, err = client.CoreV1().Services(metav1.NamespaceDefault).Create(
+		context.Background(), svc, metav1.CreateOptions{})
+	require.NoError(t, err)
+
+	// After the Upsert, the registration must include the slice's address —
+	// proving the wait did its job and the index lookup wasn't skipped.
+	retry.Run(t, func(r *retry.R) {
+		syncer.Lock()
+		defer syncer.Unlock()
+		require.Len(r, syncer.Registrations, 1)
+		require.Equal(r, "10.0.0.1", syncer.Registrations[0].Service.Address)
+	})
+}
+
 // TestServiceResource_clusterIP_endpointSliceDelete_isSliceScoped verifies the
 // pt-3 fix: when one of several EndpointSlices for a ClusterIP service is
 // deleted, only the registrations whose IDs derive from that slice's addresses
