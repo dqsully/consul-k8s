@@ -1222,6 +1222,117 @@ func TestServiceResource_clusterIP(t *testing.T) {
 	})
 }
 
+// TestServiceResource_clusterIP_endpointSliceDelete_isSliceScoped verifies the
+// pt-3 fix: when one of several EndpointSlices for a ClusterIP service is
+// deleted, only the registrations whose IDs derive from that slice's addresses
+// are dropped from the syncer state. Previously (pt-2) the entire service's
+// registrations were regenerated on every slice delete, producing O(N) work
+// per slice event for services with many endpoints.
+func TestServiceResource_clusterIP_endpointSliceDelete_isSliceScoped(t *testing.T) {
+	t.Parallel()
+	client := fake.NewSimpleClientset()
+	syncer := newTestSyncer()
+	serviceResource := defaultServiceResource(client, syncer)
+	serviceResource.ClusterIPSync = true
+
+	closer := controller.TestControllerRun(&serviceResource)
+	defer closer()
+
+	svc := clusterIPService("foo", metav1.NamespaceDefault)
+	_, err := client.CoreV1().Services(metav1.NamespaceDefault).Create(
+		context.Background(), svc, metav1.CreateOptions{})
+	require.NoError(t, err)
+
+	createNodes(t, client)
+
+	mkSlice := func(name string, addrs []string) *discoveryv1.EndpointSlice {
+		nodeName := nodeName1
+		eps := make([]discoveryv1.Endpoint, 0, len(addrs))
+		for _, a := range addrs {
+			eps = append(eps, discoveryv1.Endpoint{
+				Addresses: []string{a},
+				Conditions: discoveryv1.EndpointConditions{
+					Ready:       ptr.To(true),
+					Serving:     ptr.To(true),
+					Terminating: ptr.To(false),
+				},
+				NodeName: &nodeName,
+				Zone:     ptr.To("us-west-2a"),
+			})
+		}
+		return &discoveryv1.EndpointSlice{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:   name,
+				Labels: map[string]string{discoveryv1.LabelServiceName: "foo"},
+			},
+			AddressType: discoveryv1.AddressTypeIPv4,
+			Endpoints:   eps,
+			Ports: []discoveryv1.EndpointPort{
+				{Name: ptr.To("http"), Port: ptr.To(int32(8080))},
+				{Name: ptr.To("rpc"), Port: ptr.To(int32(2000))},
+			},
+		}
+	}
+
+	sliceA := mkSlice("foo-a", []string{"1.1.1.1", "2.2.2.2"})
+	sliceB := mkSlice("foo-b", []string{"3.3.3.3", "4.4.4.4"})
+
+	_, err = client.DiscoveryV1().EndpointSlices(metav1.NamespaceDefault).
+		Create(context.Background(), sliceA, metav1.CreateOptions{})
+	require.NoError(t, err)
+	_, err = client.DiscoveryV1().EndpointSlices(metav1.NamespaceDefault).
+		Create(context.Background(), sliceB, metav1.CreateOptions{})
+	require.NoError(t, err)
+
+	addrSet := func(rs []*consulapi.CatalogRegistration) map[string]struct{} {
+		m := make(map[string]struct{})
+		for _, r := range rs {
+			m[r.Service.Address] = struct{}{}
+		}
+		return m
+	}
+
+	retry.Run(t, func(r *retry.R) {
+		syncer.Lock()
+		defer syncer.Unlock()
+		require.Len(r, syncer.Registrations, 4)
+		got := addrSet(syncer.Registrations)
+		require.Contains(r, got, "1.1.1.1")
+		require.Contains(r, got, "2.2.2.2")
+		require.Contains(r, got, "3.3.3.3")
+		require.Contains(r, got, "4.4.4.4")
+	})
+
+	// Capture the IDs registered for sliceA so we can prove they survive
+	// the deletion of sliceB without being regenerated.
+	syncer.Lock()
+	idsBefore := make(map[string]string)
+	for _, r := range syncer.Registrations {
+		idsBefore[r.Service.Address] = r.Service.ID
+	}
+	syncer.Unlock()
+
+	require.NoError(t, client.DiscoveryV1().EndpointSlices(metav1.NamespaceDefault).
+		Delete(context.Background(), sliceB.Name, metav1.DeleteOptions{}))
+
+	retry.Run(t, func(r *retry.R) {
+		syncer.Lock()
+		defer syncer.Unlock()
+		require.Len(r, syncer.Registrations, 2)
+		got := addrSet(syncer.Registrations)
+		require.Contains(r, got, "1.1.1.1")
+		require.Contains(r, got, "2.2.2.2")
+		require.NotContains(r, got, "3.3.3.3")
+		require.NotContains(r, got, "4.4.4.4")
+		// Surviving registrations keep their original IDs (slice-scoped delete,
+		// not full regeneration).
+		for _, reg := range syncer.Registrations {
+			require.Equal(r, idsBefore[reg.Service.Address], reg.Service.ID,
+				"registration ID changed for %s", reg.Service.Address)
+		}
+	})
+}
+
 // Test that the proper registrations with health checks are generated for a ClusterIP type.
 func TestServiceResource_clusterIP_healthCheck(t *testing.T) {
 	t.Parallel()

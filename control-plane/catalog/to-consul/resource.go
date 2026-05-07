@@ -806,6 +806,54 @@ func (t *ServiceResource) registerServiceInstance(
 	}
 }
 
+// removeRegistrationsForSlice removes any registrations from
+// consulMap[svcKey] whose Service.ID was derived from an endpoint address
+// belonging to the supplied EndpointSlice. This is the pt-3 slice-scoped
+// alternative to calling generateRegistrations, which would otherwise rebuild
+// the entire service's registration set on every slice delete.
+//
+// Service IDs are computed via serviceID(svcName, addr) for both ClusterIP
+// and NodePort registration paths, which makes them deterministically derivable
+// from EndpointSlice addresses without any additional bookkeeping.
+//
+// Precondition: lock must be held.
+func (t *ServiceResource) removeRegistrationsForSlice(
+	svcKey, svcName string,
+	endpointSlice *discoveryv1.EndpointSlice,
+) {
+	regs, ok := t.consulMap[svcKey]
+	if !ok || len(regs) == 0 {
+		return
+	}
+
+	removedIDs := make(map[string]struct{})
+	for _, ep := range endpointSlice.Endpoints {
+		for _, addr := range ep.Addresses {
+			removedIDs[serviceID(svcName, addr)] = struct{}{}
+		}
+	}
+	if len(removedIDs) == 0 {
+		return
+	}
+
+	kept := regs[:0]
+	for _, r := range regs {
+		if r == nil || r.Service == nil {
+			kept = append(kept, r)
+			continue
+		}
+		if _, drop := removedIDs[r.Service.ID]; drop {
+			continue
+		}
+		kept = append(kept, r)
+	}
+	if len(kept) == 0 {
+		delete(t.consulMap, svcKey)
+		return
+	}
+	t.consulMap[svcKey] = kept
+}
+
 // sync calls the Syncer.Sync function from the generated registrations.
 //
 // Precondition: lock must be held.
@@ -939,8 +987,14 @@ func (t *serviceEndpointsResource) Delete(endptKey string, raw interface{}) erro
 				// Skip generating registrations if this was the last Endpoint
 				delete(t.Service.consulMap, svcKey)
 			} else {
-				// Otherwise, treat this like an upsert of sorts
-				t.Service.generateRegistrations(svcKey)
+				// pt-3: only drop registrations belonging to this slice instead of
+				// regenerating the entire service's registration set. For services
+				// with many endpoints (thousands) spread across many EndpointSlices,
+				// the full regeneration in pt-2 was O(total_endpoints) per slice
+				// event, producing large amounts of redundant work and triggering
+				// unnecessary deregister/re-register churn through the Syncer's
+				// reaper. This path is O(deleted_slice_endpoints).
+				t.Service.removeRegistrationsForSlice(svcKey, svcName, endpointSlice)
 			}
 
 			t.Service.sync()
