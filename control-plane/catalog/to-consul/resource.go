@@ -864,13 +864,19 @@ func (t *ServiceResource) registerServiceInstance(
 // alternative to calling generateRegistrations, which would otherwise rebuild
 // the entire service's registration set on every slice delete.
 //
-// Service IDs are computed via serviceID(svcName, addr) for both ClusterIP
-// and NodePort registration paths, which makes them deterministically derivable
-// from EndpointSlice addresses without any additional bookkeeping.
+// Service IDs are computed via serviceID(consulServiceName, addr) for both
+// ClusterIP and NodePort registration paths. The consul service name may
+// differ from the K8s service name due to ConsulServicePrefix,
+// AddK8SNamespaceSuffix, or the consul.hashicorp.com/service-name annotation,
+// so we cannot reconstruct IDs from the K8s service name alone. Instead, we
+// read the consul service name from an existing registration in
+// consulMap[svcKey] (all entries for the same K8s service share the same
+// consul service name, derived once in generateRegistrations) and use that
+// to recompute the IDs to remove.
 //
 // Precondition: lock must be held.
 func (t *ServiceResource) removeRegistrationsForSlice(
-	svcKey, svcName string,
+	svcKey string,
 	endpointSlice *discoveryv1.EndpointSlice,
 ) {
 	regs, ok := t.consulMap[svcKey]
@@ -878,10 +884,24 @@ func (t *ServiceResource) removeRegistrationsForSlice(
 		return
 	}
 
+	// Discover the consul service name from any existing registration. All
+	// registrations under svcKey are for the same K8s service and therefore
+	// share the same Service.Service value.
+	var consulName string
+	for _, r := range regs {
+		if r != nil && r.Service != nil && r.Service.Service != "" {
+			consulName = r.Service.Service
+			break
+		}
+	}
+	if consulName == "" {
+		return
+	}
+
 	removedIDs := make(map[string]struct{})
 	for _, ep := range endpointSlice.Endpoints {
 		for _, addr := range ep.Addresses {
-			removedIDs[serviceID(svcName, addr)] = struct{}{}
+			removedIDs[serviceID(consulName, addr)] = struct{}{}
 		}
 	}
 	if len(removedIDs) == 0 {
@@ -1046,7 +1066,7 @@ func (t *serviceEndpointsResource) Delete(endptKey string, raw interface{}) erro
 				// event, producing large amounts of redundant work and triggering
 				// unnecessary deregister/re-register churn through the Syncer's
 				// reaper. This path is O(deleted_slice_endpoints).
-				t.Service.removeRegistrationsForSlice(svcKey, svcName, endpointSlice)
+				t.Service.removeRegistrationsForSlice(svcKey, endpointSlice)
 			}
 
 			t.Service.sync()

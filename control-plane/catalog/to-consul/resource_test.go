@@ -1413,6 +1413,103 @@ func TestServiceResource_clusterIP_endpointSliceDelete_isSliceScoped(t *testing.
 	})
 }
 
+// TestServiceResource_clusterIP_endpointSliceDelete_withK8SNamespaceSuffix
+// verifies that pt-3's slice-scoped delete works when AddK8SNamespaceSuffix
+// is enabled. With the suffix on, the Consul service name differs from the
+// K8s service name (e.g. K8s "foo" -> Consul "foo-default"), so the IDs
+// stored on registrations are derived from the suffixed name. An earlier
+// pt-3 version that recomputed IDs from the K8s name (unsuffixed) failed
+// to match any stored IDs and the deleted slice's entries were re-emitted
+// by every subsequent sync. This test pins the suffix-aware behavior.
+func TestServiceResource_clusterIP_endpointSliceDelete_withK8SNamespaceSuffix(t *testing.T) {
+	t.Parallel()
+	client := fake.NewSimpleClientset()
+	syncer := newTestSyncer()
+	serviceResource := defaultServiceResource(client, syncer)
+	serviceResource.ClusterIPSync = true
+	serviceResource.AddK8SNamespaceSuffix = true
+
+	closer := controller.TestControllerRun(&serviceResource)
+	defer closer()
+
+	svc := clusterIPService("foo", metav1.NamespaceDefault)
+	_, err := client.CoreV1().Services(metav1.NamespaceDefault).Create(
+		context.Background(), svc, metav1.CreateOptions{})
+	require.NoError(t, err)
+
+	createNodes(t, client)
+
+	mkSlice := func(name string, addrs []string) *discoveryv1.EndpointSlice {
+		nodeName := nodeName1
+		eps := make([]discoveryv1.Endpoint, 0, len(addrs))
+		for _, a := range addrs {
+			eps = append(eps, discoveryv1.Endpoint{
+				Addresses: []string{a},
+				Conditions: discoveryv1.EndpointConditions{
+					Ready:       ptr.To(true),
+					Serving:     ptr.To(true),
+					Terminating: ptr.To(false),
+				},
+				NodeName: &nodeName,
+				Zone:     ptr.To("us-west-2a"),
+			})
+		}
+		return &discoveryv1.EndpointSlice{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:   name,
+				Labels: map[string]string{discoveryv1.LabelServiceName: "foo"},
+			},
+			AddressType: discoveryv1.AddressTypeIPv4,
+			Endpoints:   eps,
+			Ports: []discoveryv1.EndpointPort{
+				{Name: ptr.To("http"), Port: ptr.To(int32(8080))},
+				{Name: ptr.To("rpc"), Port: ptr.To(int32(2000))},
+			},
+		}
+	}
+
+	sliceA := mkSlice("foo-a", []string{"1.1.1.1", "2.2.2.2"})
+	sliceB := mkSlice("foo-b", []string{"3.3.3.3", "4.4.4.4"})
+
+	_, err = client.DiscoveryV1().EndpointSlices(metav1.NamespaceDefault).
+		Create(context.Background(), sliceA, metav1.CreateOptions{})
+	require.NoError(t, err)
+	_, err = client.DiscoveryV1().EndpointSlices(metav1.NamespaceDefault).
+		Create(context.Background(), sliceB, metav1.CreateOptions{})
+	require.NoError(t, err)
+
+	retry.Run(t, func(r *retry.R) {
+		syncer.Lock()
+		defer syncer.Unlock()
+		require.Len(r, syncer.Registrations, 4)
+		// Consul service name MUST include the namespace suffix.
+		for _, reg := range syncer.Registrations {
+			require.Equal(r, "foo-default", reg.Service.Service)
+		}
+	})
+
+	require.NoError(t, client.DiscoveryV1().EndpointSlices(metav1.NamespaceDefault).
+		Delete(context.Background(), sliceB.Name, metav1.DeleteOptions{}))
+
+	retry.Run(t, func(r *retry.R) {
+		syncer.Lock()
+		defer syncer.Unlock()
+		// Only sliceA's two entries should remain after the delete; without
+		// the suffix-aware fix, the helper would fail to match any IDs and
+		// all 4 would persist.
+		require.Len(r, syncer.Registrations, 2)
+		addrs := make(map[string]struct{})
+		for _, reg := range syncer.Registrations {
+			addrs[reg.Service.Address] = struct{}{}
+			require.Equal(r, "foo-default", reg.Service.Service)
+		}
+		require.Contains(r, addrs, "1.1.1.1")
+		require.Contains(r, addrs, "2.2.2.2")
+		require.NotContains(r, addrs, "3.3.3.3")
+		require.NotContains(r, addrs, "4.4.4.4")
+	})
+}
+
 // Test that the proper registrations with health checks are generated for a ClusterIP type.
 func TestServiceResource_clusterIP_healthCheck(t *testing.T) {
 	t.Parallel()
