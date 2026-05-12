@@ -152,6 +152,13 @@ type ServiceResource struct {
 	// controller so that we can query its cache on new discovered services.
 	endpointsController *controller.Controller
 
+	// outerController is a reference to the controller.Controller that
+	// drives ServiceResource itself. It is set by the controller package
+	// via the ControllerAware interface before Run is called. Used by
+	// pt-5 to wait for the outer Service controller's initial events to
+	// be fully processed before unblocking the Syncer's reaper.
+	outerController *controller.Controller
+
 	// serviceLock must be held for any read/write to these maps.
 	serviceLock sync.RWMutex
 
@@ -315,6 +322,14 @@ func (t *ServiceResource) doDelete(key string) {
 	}
 }
 
+// SetController implements controller.ControllerAware. The outer
+// controller.Controller calls this on its Resource (us) before any background
+// goroutines start, so ServiceResource can observe HasInitialEventsProcessed
+// on it from pt-5's gating goroutine.
+func (t *ServiceResource) SetController(c *controller.Controller) {
+	t.outerController = c
+}
+
 // Run implements the controller.Backgrounder interface.
 func (t *ServiceResource) Run(ch <-chan struct{}) {
 	t.Log.Info("starting runner for endpoints")
@@ -335,7 +350,56 @@ func (t *ServiceResource) Run(ch <-chan struct{}) {
 		Log: t.Log.Named("controller/service"),
 	}
 
+	// pt-5: gate the Syncer's reaper on both the outer (Service) and inner
+	// (EndpointSlice) controllers having processed their initial-LIST events.
+	// Without this gate, the very first Sync(rs) call from any Service Upsert
+	// closes the Syncer's initialSync channel; if the reaper polls before all
+	// other Service Upserts have been processed, those services won't be in
+	// serviceNames and the reaper schedules their entire existing Consul
+	// catalog for deregister.
+	//
+	// We only enable the gate if the Syncer supports it AND we have a
+	// reference to the outer Controller (set via SetController). Otherwise we
+	// fall back to the legacy behavior — the first Sync(rs) unblocks the
+	// reaper, same as before.
+	if gate, ok := t.Syncer.(InitialSyncGate); ok && t.outerController != nil {
+		gate.EnableInitialSyncGate()
+		go t.signalSyncerWhenInitialEventsProcessed(ch, gate)
+	}
+
 	t.endpointsController.Run(ch)
+}
+
+// signalSyncerWhenInitialEventsProcessed waits for both the outer and inner
+// controllers to report HasInitialEventsProcessed, then calls Ready() on the
+// Syncer to release the reaper. Runs in its own goroutine; exits early if the
+// stop channel closes.
+func (t *ServiceResource) signalSyncerWhenInitialEventsProcessed(
+	stopCh <-chan struct{},
+	gate InitialSyncGate,
+) {
+	// Wait for the outer Service controller to fully process its initial LIST.
+	// Once true, all Service Upserts have written into consulMap (gated by
+	// pt-4's wait inside Upsert, which ensures GetByIndex on the inner
+	// EndpointSlice cache was complete).
+	if !cache.WaitForCacheSync(stopCh, t.outerController.HasInitialEventsProcessed) {
+		t.Log.Info("stopped before outer controller reported initial events processed; not signaling syncer")
+		return
+	}
+	// Wait for the inner EndpointSlice controller likewise — by this point,
+	// every initial slice event has been drained (slice events whose parent
+	// Service was already tracked have updated endpointSlicesMap and pushed
+	// state via sync(); slice events whose parent wasn't tracked yet were
+	// silently dropped by shouldTrackEndpoints and will be handled by future
+	// WATCH events).
+	if t.endpointsController != nil {
+		if !cache.WaitForCacheSync(stopCh, t.endpointsController.HasInitialEventsProcessed) {
+			t.Log.Info("stopped before endpoints controller reported initial events processed; not signaling syncer")
+			return
+		}
+	}
+	t.Log.Info("both controllers have processed initial events; releasing syncer reaper")
+	gate.Ready()
 }
 
 // waitForEndpointsCacheSync blocks until the EndpointSlice informer's local
