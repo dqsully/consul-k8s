@@ -1222,6 +1222,294 @@ func TestServiceResource_clusterIP(t *testing.T) {
 	})
 }
 
+// TestServiceResource_waitForEndpointsCacheSync_returnsFalseWhenContextCancelled
+// pins down the pt-4 helper's behavior: when called before endpointsController
+// has been initialized and the context is already cancelled, the helper must
+// not spin or panic and must return false promptly.
+func TestServiceResource_waitForEndpointsCacheSync_returnsFalseWhenContextCancelled(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	sr := &ServiceResource{
+		Log: hclog.NewNullLogger(),
+		Ctx: ctx,
+	}
+
+	require.False(t, sr.waitForEndpointsCacheSync(),
+		"expected helper to return false when context is already cancelled")
+}
+
+// TestServiceResource_waitForEndpointsCacheSync_returnsTrueOnSync verifies the
+// pt-4 helper completes successfully once the inner endpointsController has
+// reported HasSynced. Uses the standard test harness to start the controller
+// with no events, then asserts a Service Upsert proceeds to register endpoints
+// without losing any to the startup race.
+func TestServiceResource_waitForEndpointsCacheSync_returnsTrueOnSync(t *testing.T) {
+	t.Parallel()
+	client := fake.NewSimpleClientset()
+	syncer := newTestSyncer()
+	serviceResource := defaultServiceResource(client, syncer)
+	serviceResource.ClusterIPSync = true
+
+	closer := controller.TestControllerRun(&serviceResource)
+	defer closer()
+
+	// Create the EndpointSlices first, then the Service. This is the order
+	// most likely to expose the pt-1 race: by the time the Service Upsert
+	// fires, the EndpointSlice informer's cache should have these slices —
+	// and the pt-4 wait ensures the index lookup sees them rather than
+	// returning empty.
+	_, err := client.DiscoveryV1().EndpointSlices(metav1.NamespaceDefault).Create(
+		context.Background(),
+		&discoveryv1.EndpointSlice{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:   "foo-aaa",
+				Labels: map[string]string{discoveryv1.LabelServiceName: "foo"},
+			},
+			AddressType: discoveryv1.AddressTypeIPv4,
+			Endpoints: []discoveryv1.Endpoint{
+				{
+					Addresses: []string{"10.0.0.1"},
+					Conditions: discoveryv1.EndpointConditions{
+						Ready: ptr.To(true), Serving: ptr.To(true), Terminating: ptr.To(false),
+					},
+				},
+			},
+			Ports: []discoveryv1.EndpointPort{
+				{Name: ptr.To("http"), Port: ptr.To(int32(8080))},
+				{Name: ptr.To("rpc"), Port: ptr.To(int32(2000))},
+			},
+		},
+		metav1.CreateOptions{})
+	require.NoError(t, err)
+
+	createNodes(t, client)
+
+	svc := clusterIPService("foo", metav1.NamespaceDefault)
+	_, err = client.CoreV1().Services(metav1.NamespaceDefault).Create(
+		context.Background(), svc, metav1.CreateOptions{})
+	require.NoError(t, err)
+
+	// After the Upsert, the registration must include the slice's address —
+	// proving the wait did its job and the index lookup wasn't skipped.
+	retry.Run(t, func(r *retry.R) {
+		syncer.Lock()
+		defer syncer.Unlock()
+		require.Len(r, syncer.Registrations, 1)
+		require.Equal(r, "10.0.0.1", syncer.Registrations[0].Service.Address)
+	})
+}
+
+// TestServiceResource_clusterIP_endpointSliceDelete_isSliceScoped verifies the
+// pt-3 fix: when one of several EndpointSlices for a ClusterIP service is
+// deleted, only the registrations whose IDs derive from that slice's addresses
+// are dropped from the syncer state. Previously (pt-2) the entire service's
+// registrations were regenerated on every slice delete, producing O(N) work
+// per slice event for services with many endpoints.
+func TestServiceResource_clusterIP_endpointSliceDelete_isSliceScoped(t *testing.T) {
+	t.Parallel()
+	client := fake.NewSimpleClientset()
+	syncer := newTestSyncer()
+	serviceResource := defaultServiceResource(client, syncer)
+	serviceResource.ClusterIPSync = true
+
+	closer := controller.TestControllerRun(&serviceResource)
+	defer closer()
+
+	svc := clusterIPService("foo", metav1.NamespaceDefault)
+	_, err := client.CoreV1().Services(metav1.NamespaceDefault).Create(
+		context.Background(), svc, metav1.CreateOptions{})
+	require.NoError(t, err)
+
+	createNodes(t, client)
+
+	mkSlice := func(name string, addrs []string) *discoveryv1.EndpointSlice {
+		nodeName := nodeName1
+		eps := make([]discoveryv1.Endpoint, 0, len(addrs))
+		for _, a := range addrs {
+			eps = append(eps, discoveryv1.Endpoint{
+				Addresses: []string{a},
+				Conditions: discoveryv1.EndpointConditions{
+					Ready:       ptr.To(true),
+					Serving:     ptr.To(true),
+					Terminating: ptr.To(false),
+				},
+				NodeName: &nodeName,
+				Zone:     ptr.To("us-west-2a"),
+			})
+		}
+		return &discoveryv1.EndpointSlice{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:   name,
+				Labels: map[string]string{discoveryv1.LabelServiceName: "foo"},
+			},
+			AddressType: discoveryv1.AddressTypeIPv4,
+			Endpoints:   eps,
+			Ports: []discoveryv1.EndpointPort{
+				{Name: ptr.To("http"), Port: ptr.To(int32(8080))},
+				{Name: ptr.To("rpc"), Port: ptr.To(int32(2000))},
+			},
+		}
+	}
+
+	sliceA := mkSlice("foo-a", []string{"1.1.1.1", "2.2.2.2"})
+	sliceB := mkSlice("foo-b", []string{"3.3.3.3", "4.4.4.4"})
+
+	_, err = client.DiscoveryV1().EndpointSlices(metav1.NamespaceDefault).
+		Create(context.Background(), sliceA, metav1.CreateOptions{})
+	require.NoError(t, err)
+	_, err = client.DiscoveryV1().EndpointSlices(metav1.NamespaceDefault).
+		Create(context.Background(), sliceB, metav1.CreateOptions{})
+	require.NoError(t, err)
+
+	addrSet := func(rs []*consulapi.CatalogRegistration) map[string]struct{} {
+		m := make(map[string]struct{})
+		for _, r := range rs {
+			m[r.Service.Address] = struct{}{}
+		}
+		return m
+	}
+
+	retry.Run(t, func(r *retry.R) {
+		syncer.Lock()
+		defer syncer.Unlock()
+		require.Len(r, syncer.Registrations, 4)
+		got := addrSet(syncer.Registrations)
+		require.Contains(r, got, "1.1.1.1")
+		require.Contains(r, got, "2.2.2.2")
+		require.Contains(r, got, "3.3.3.3")
+		require.Contains(r, got, "4.4.4.4")
+	})
+
+	// Capture the IDs registered for sliceA so we can prove they survive
+	// the deletion of sliceB without being regenerated.
+	syncer.Lock()
+	idsBefore := make(map[string]string)
+	for _, r := range syncer.Registrations {
+		idsBefore[r.Service.Address] = r.Service.ID
+	}
+	syncer.Unlock()
+
+	require.NoError(t, client.DiscoveryV1().EndpointSlices(metav1.NamespaceDefault).
+		Delete(context.Background(), sliceB.Name, metav1.DeleteOptions{}))
+
+	retry.Run(t, func(r *retry.R) {
+		syncer.Lock()
+		defer syncer.Unlock()
+		require.Len(r, syncer.Registrations, 2)
+		got := addrSet(syncer.Registrations)
+		require.Contains(r, got, "1.1.1.1")
+		require.Contains(r, got, "2.2.2.2")
+		require.NotContains(r, got, "3.3.3.3")
+		require.NotContains(r, got, "4.4.4.4")
+		// Surviving registrations keep their original IDs (slice-scoped delete,
+		// not full regeneration).
+		for _, reg := range syncer.Registrations {
+			require.Equal(r, idsBefore[reg.Service.Address], reg.Service.ID,
+				"registration ID changed for %s", reg.Service.Address)
+		}
+	})
+}
+
+// TestServiceResource_clusterIP_endpointSliceDelete_withK8SNamespaceSuffix
+// verifies that pt-3's slice-scoped delete works when AddK8SNamespaceSuffix
+// is enabled. With the suffix on, the Consul service name differs from the
+// K8s service name (e.g. K8s "foo" -> Consul "foo-default"), so the IDs
+// stored on registrations are derived from the suffixed name. An earlier
+// pt-3 version that recomputed IDs from the K8s name (unsuffixed) failed
+// to match any stored IDs and the deleted slice's entries were re-emitted
+// by every subsequent sync. This test pins the suffix-aware behavior.
+func TestServiceResource_clusterIP_endpointSliceDelete_withK8SNamespaceSuffix(t *testing.T) {
+	t.Parallel()
+	client := fake.NewSimpleClientset()
+	syncer := newTestSyncer()
+	serviceResource := defaultServiceResource(client, syncer)
+	serviceResource.ClusterIPSync = true
+	serviceResource.AddK8SNamespaceSuffix = true
+
+	closer := controller.TestControllerRun(&serviceResource)
+	defer closer()
+
+	svc := clusterIPService("foo", metav1.NamespaceDefault)
+	_, err := client.CoreV1().Services(metav1.NamespaceDefault).Create(
+		context.Background(), svc, metav1.CreateOptions{})
+	require.NoError(t, err)
+
+	createNodes(t, client)
+
+	mkSlice := func(name string, addrs []string) *discoveryv1.EndpointSlice {
+		nodeName := nodeName1
+		eps := make([]discoveryv1.Endpoint, 0, len(addrs))
+		for _, a := range addrs {
+			eps = append(eps, discoveryv1.Endpoint{
+				Addresses: []string{a},
+				Conditions: discoveryv1.EndpointConditions{
+					Ready:       ptr.To(true),
+					Serving:     ptr.To(true),
+					Terminating: ptr.To(false),
+				},
+				NodeName: &nodeName,
+				Zone:     ptr.To("us-west-2a"),
+			})
+		}
+		return &discoveryv1.EndpointSlice{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:   name,
+				Labels: map[string]string{discoveryv1.LabelServiceName: "foo"},
+			},
+			AddressType: discoveryv1.AddressTypeIPv4,
+			Endpoints:   eps,
+			Ports: []discoveryv1.EndpointPort{
+				{Name: ptr.To("http"), Port: ptr.To(int32(8080))},
+				{Name: ptr.To("rpc"), Port: ptr.To(int32(2000))},
+			},
+		}
+	}
+
+	sliceA := mkSlice("foo-a", []string{"1.1.1.1", "2.2.2.2"})
+	sliceB := mkSlice("foo-b", []string{"3.3.3.3", "4.4.4.4"})
+
+	_, err = client.DiscoveryV1().EndpointSlices(metav1.NamespaceDefault).
+		Create(context.Background(), sliceA, metav1.CreateOptions{})
+	require.NoError(t, err)
+	_, err = client.DiscoveryV1().EndpointSlices(metav1.NamespaceDefault).
+		Create(context.Background(), sliceB, metav1.CreateOptions{})
+	require.NoError(t, err)
+
+	retry.Run(t, func(r *retry.R) {
+		syncer.Lock()
+		defer syncer.Unlock()
+		require.Len(r, syncer.Registrations, 4)
+		// Consul service name MUST include the namespace suffix.
+		for _, reg := range syncer.Registrations {
+			require.Equal(r, "foo-default", reg.Service.Service)
+		}
+	})
+
+	require.NoError(t, client.DiscoveryV1().EndpointSlices(metav1.NamespaceDefault).
+		Delete(context.Background(), sliceB.Name, metav1.DeleteOptions{}))
+
+	retry.Run(t, func(r *retry.R) {
+		syncer.Lock()
+		defer syncer.Unlock()
+		// Only sliceA's two entries should remain after the delete; without
+		// the suffix-aware fix, the helper would fail to match any IDs and
+		// all 4 would persist.
+		require.Len(r, syncer.Registrations, 2)
+		addrs := make(map[string]struct{})
+		for _, reg := range syncer.Registrations {
+			addrs[reg.Service.Address] = struct{}{}
+			require.Equal(r, "foo-default", reg.Service.Service)
+		}
+		require.Contains(r, addrs, "1.1.1.1")
+		require.Contains(r, addrs, "2.2.2.2")
+		require.NotContains(r, addrs, "3.3.3.3")
+		require.NotContains(r, addrs, "4.4.4.4")
+	})
+}
+
 // Test that the proper registrations with health checks are generated for a ClusterIP type.
 func TestServiceResource_clusterIP_healthCheck(t *testing.T) {
 	t.Parallel()

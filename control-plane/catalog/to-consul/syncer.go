@@ -74,6 +74,31 @@ type Syncer interface {
 	Sync([]*api.CatalogRegistration)
 }
 
+// InitialSyncGate is an optional interface a Syncer may implement to defer
+// the start of background reaping (e.g., watchReapableServices) until the
+// caller signals that the initial state push from the source-of-truth side
+// is complete.
+//
+// Without this gate, the very first call to Sync(rs) unblocks the reaper —
+// which may then see a partial picture of desired state if more Upsert
+// handlers in the source are still pending. The reaper would schedule the
+// not-yet-pushed services for deregistration, producing a cold-start
+// mass-deregister storm. pt-5 wires this gate so the reaper waits until
+// both the Service and EndpointSlice controllers have processed every
+// event from their initial LIST.
+//
+// Implementations must remain backward compatible: if EnableInitialSyncGate
+// is never called, Sync(rs) MUST unblock the reaper on first call (legacy
+// behavior). Callers that do enable the gate MUST eventually call Ready()
+// to release it, otherwise the reaper never starts.
+type InitialSyncGate interface {
+	// EnableInitialSyncGate switches the Syncer to gated mode. Must be
+	// called before the first Sync(rs).
+	EnableInitialSyncGate()
+	// Ready releases the gate. Subsequent Sync(rs) calls behave normally.
+	Ready()
+}
+
 // ConsulSyncer is a Syncer that takes the set of registrations and
 // registers them with Consul. It also watches Consul for changes to the
 // services and ensures the local set of registrations represents the
@@ -127,6 +152,11 @@ type ConsulSyncer struct {
 	// to ensure it isn't closed more than once.
 	initialSyncOnce sync.Once
 
+	// initialSyncGated, when true, suppresses the per-Sync(rs) close of
+	// initialSync. The Syncer relies on Ready() being called to release the
+	// reaper. See InitialSyncGate.
+	initialSyncGated bool
+
 	// serviceNames is all namespaces mapped to a set of valid
 	// Consul service names
 	serviceNames map[string]mapset.Set
@@ -175,6 +205,35 @@ func (s *ConsulSyncer) Sync(rs []*api.CatalogRegistration) {
 
 	// Signal that the initial sync is complete and our maps have been populated.
 	// We can now safely reap untracked services.
+	//
+	// When initialSyncGated is set (pt-5), the caller is responsible for
+	// invoking Ready() once it has driven the source-of-truth side through
+	// all of its initial events. Skipping the close here prevents the reaper
+	// from starting while serviceNames is still partial — which would
+	// otherwise schedule the not-yet-Upserted services for deregistration.
+	if !s.initialSyncGated {
+		s.initialSyncOnce.Do(func() { close(s.initialSync) })
+	}
+}
+
+// EnableInitialSyncGate switches the Syncer to gated mode. The very first
+// Sync(rs) will no longer unblock the reaper; the caller must invoke Ready()
+// after it has finished driving the source-of-truth side through its initial
+// events. See the InitialSyncGate interface for context.
+//
+// Safe to call at most once, before the first Sync(rs).
+func (s *ConsulSyncer) EnableInitialSyncGate() {
+	s.lock.Lock()
+	defer s.lock.Unlock()
+	s.initialSyncGated = true
+}
+
+// Ready releases the initial-sync gate set up by EnableInitialSyncGate, allowing
+// the reaper to start. Subsequent Sync(rs) calls behave normally (the gate is
+// only for the very first close of initialSync). Idempotent.
+func (s *ConsulSyncer) Ready() {
+	s.lock.Lock()
+	defer s.lock.Unlock()
 	s.initialSyncOnce.Do(func() { close(s.initialSync) })
 }
 

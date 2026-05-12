@@ -26,6 +26,29 @@ type Controller struct {
 	Resource Resource
 
 	informer cache.SharedIndexInformer
+
+	// registration is the handle returned by AddEventHandler and is used to
+	// detect when the initial set of OnAdd events have been delivered to the
+	// handler. Combined with informer.HasSynced and queue.Len, this lets
+	// HasInitialEventsProcessed report when all initial-list events have been
+	// fully processed by the worker loop.
+	registration cache.ResourceEventHandlerRegistration
+
+	// queue is the workqueue used to defer event processing out of the
+	// informer's event-handler callbacks. Stored on the Controller so that
+	// callers can observe queue length via HasInitialEventsProcessed.
+	queue workqueue.RateLimitingInterface
+}
+
+// ControllerAware is an optional interface a Resource (or its Backgrounder)
+// may implement to receive a reference to the outer Controller before Run
+// starts. This is used by ServiceResource (pt-5) to orchestrate cross-
+// controller initial-sync ordering — once both the outer Service controller
+// and the inner EndpointSlice controller report HasInitialEventsProcessed,
+// the Syncer's reaper can safely be unblocked without false-positive
+// "service not in serviceNames" findings.
+type ControllerAware interface {
+	SetController(c *Controller)
 }
 
 // Event is something that occurred to the resources we're watching.
@@ -56,13 +79,16 @@ func (c *Controller) Run(stopCh <-chan struct{}) {
 	// Create a queue for storing items to process from the informer.
 	var queueOnce sync.Once
 	queue := workqueue.NewRateLimitingQueue(workqueue.DefaultControllerRateLimiter())
+	c.queue = queue
 	shutdown := func() { queue.ShutDown() }
 	defer queueOnce.Do(shutdown)
 
 	// Add an event handler when data is received from the informer. The
 	// event handlers here will block the informer so we just offload them
-	// immediately into a workqueue.
-	_, err := informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+	// immediately into a workqueue. The handle returned by AddEventHandler
+	// lets us observe via HasSynced() whether all initial-list OnAdd events
+	// have been delivered yet.
+	registration, err := informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
 			// convert the resource object into a key (in this case
 			// we are just doing it in the format of 'namespace/name')
@@ -83,6 +109,14 @@ func (c *Controller) Run(stopCh <-chan struct{}) {
 	})
 	if err != nil {
 		c.Log.Error("error adding informer event handlers", err)
+	}
+	c.registration = registration
+
+	// Give the Resource a reference to this Controller before we start any
+	// background work. Resources that implement ControllerAware use this to
+	// observe HasInitialEventsProcessed across controllers (pt-5).
+	if aware, ok := c.Resource.(ControllerAware); ok {
+		aware.SetController(c)
 	}
 
 	// If the type is a background syncer, then we startup the background
@@ -138,6 +172,37 @@ func (c *Controller) Run(stopCh <-chan struct{}) {
 			// Process
 		}
 	}, time.Second, stopCh)
+}
+
+// HasInitialEventsProcessed reports whether the controller has finished
+// processing every event that was queued by the informer's initial LIST.
+// It combines three signals:
+//
+//   - informer.HasSynced(): the local cache has been populated by the initial LIST.
+//   - registration.HasSynced(): the OnAdd handler has been invoked for every
+//     item discovered by the initial LIST (i.e., everything has been enqueued).
+//   - queue.Len() == 0: the worker loop has finished pulling all enqueued items
+//     out of the queue.
+//
+// Because the OnAdd handler only enqueues to the workqueue, "all initial events
+// have fired" is not the same as "all initial work is done" — the worker still
+// has to drain the queue. The third condition closes that gap.
+//
+// Note: after WATCH events start arriving, queue.Len may transiently become
+// non-zero again. Callers should treat the first observation of `true` as the
+// signal that the initial-list bulk processing is complete, and not flap based
+// on subsequent transient values.
+func (c *Controller) HasInitialEventsProcessed() bool {
+	if c.informer == nil || c.registration == nil || c.queue == nil {
+		return false
+	}
+	if !c.informer.HasSynced() {
+		return false
+	}
+	if !c.registration.HasSynced() {
+		return false
+	}
+	return c.queue.Len() == 0
 }
 
 // HasSynced implements cache.Controller.
@@ -209,6 +274,15 @@ func (c *Controller) processSingle(
 	}
 
 	return true
+}
+
+// GetByIndex allows querying the informer's indexer to avoid extra calls to k8s
+func (c *Controller) GetByIndex(indexName, indexedValue string) ([]interface{}, error) {
+	if c.informer == nil {
+		return nil, nil
+	}
+
+	return c.informer.GetIndexer().ByIndex(indexName, indexedValue)
 }
 
 // informerDeleteHandler returns a function that implements

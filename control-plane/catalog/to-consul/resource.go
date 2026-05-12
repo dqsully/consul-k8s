@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	mapset "github.com/deckarep/golang-set"
 	"github.com/hashicorp/consul-k8s/control-plane/catalog/metrics"
@@ -47,6 +48,8 @@ const (
 	consulKubernetesCheckName  = "Kubernetes Readiness Check"
 	kubernetesSuccessReasonMsg = "Kubernetes health checks passing"
 	kubernetesFailureReasonMsg = "Kubernetes health checks failing"
+
+	endpointServiceIndexName = "metadata.labels[" + discoveryv1.LabelServiceName + "]"
 )
 
 type NodePortSyncType string
@@ -145,6 +148,17 @@ type ServiceResource struct {
 	// The Consul node name to register service with.
 	ConsulNodeName string
 
+	// endpointsController holds a reference to the serviceEndpointsResource
+	// controller so that we can query its cache on new discovered services.
+	endpointsController *controller.Controller
+
+	// outerController is a reference to the controller.Controller that
+	// drives ServiceResource itself. It is set by the controller package
+	// via the ControllerAware interface before Run is called. Used by
+	// pt-5 to wait for the outer Service controller's initial events to
+	// be fully processed before unblocking the Syncer's reaper.
+	outerController *controller.Controller
+
 	// serviceLock must be held for any read/write to these maps.
 	serviceLock sync.RWMutex
 
@@ -238,45 +252,42 @@ func (t *ServiceResource) Upsert(key string, raw interface{}) error {
 
 	// If we care about endpoints, we should load the associated endpoint slices.
 	if t.shouldTrackEndpoints(key) {
+		// pt-4: wait for the EndpointSlice informer to finish its initial cache
+		// sync before doing the index lookup. Without this, a Service Upsert that
+		// fires before the EndpointSlice informer has finished its initial LIST
+		// hits an empty informer index, populates endpointSlicesMap[key] with no
+		// entries, leaves consulMap[key] empty, and pushes a partial Sync(rs) to
+		// the Syncer. That partial sync closes initialSyncOnce, starting the
+		// reaper with an incomplete view of desired state, which then schedules
+		// every existing instance of this service in consul for deregister.
+		// The pt-1 switch from a direct paginated K8s API call to the informer
+		// index lookup introduced this dependency on cache-sync ordering between
+		// two independent Controllers; this gate makes the dependency explicit.
+		if !t.waitForEndpointsCacheSync() {
+			// Context cancelled while waiting; controller is shutting down.
+			return nil
+		}
+
 		allEndpointSlices := make(map[string]*discoveryv1.EndpointSlice)
-		labelSelector := fmt.Sprintf("%s=%s", discoveryv1.LabelServiceName, service.Name)
-		continueToken := ""
-		limit := int64(100)
 
-		for {
-			opts := metav1.ListOptions{
-				LabelSelector: labelSelector,
-				Limit:         limit,
-				Continue:      continueToken,
-			}
-			endpointSliceList, err := t.Client.DiscoveryV1().
-				EndpointSlices(service.Namespace).
-				List(t.Ctx, opts)
-
-			if err != nil {
-				t.Log.Warn("error loading endpoint slices list",
-					"key", key,
-					"err", err)
-				break
-			}
-
-			for _, endpointSlice := range endpointSliceList.Items {
+		endpointSliceList, err := t.endpointsController.GetByIndex(endpointServiceIndexName, key)
+		if err != nil {
+			t.Log.Warn("error loading endpoint slices list",
+				"key", key,
+				"err", err)
+		} else {
+			for _, item := range endpointSliceList {
+				endpointSlice := item.(*discoveryv1.EndpointSlice)
 				endptKey := service.Namespace + "/" + endpointSlice.Name
-				allEndpointSlices[endptKey] = &endpointSlice
+				allEndpointSlices[endptKey] = endpointSlice
 			}
 
-			if endpointSliceList.Continue != "" {
-				continueToken = endpointSliceList.Continue
-			} else {
-				break
+			if t.endpointSlicesMap == nil {
+				t.endpointSlicesMap = make(map[string]map[string]*discoveryv1.EndpointSlice)
 			}
+			t.endpointSlicesMap[key] = allEndpointSlices
+			t.Log.Debug("[ServiceResource.Upsert] adding service's endpoint slices to endpointSlicesMap", "key", key, "service", service, "endpointSlices", allEndpointSlices)
 		}
-
-		if t.endpointSlicesMap == nil {
-			t.endpointSlicesMap = make(map[string]map[string]*discoveryv1.EndpointSlice)
-		}
-		t.endpointSlicesMap[key] = allEndpointSlices
-		t.Log.Debug("[ServiceResource.Upsert] adding service's endpoint slices to endpointSlicesMap", "key", key, "service", service, "endpointSlices", allEndpointSlices)
 	}
 
 	// Update the registration and trigger a sync
@@ -311,12 +322,20 @@ func (t *ServiceResource) doDelete(key string) {
 	}
 }
 
+// SetController implements controller.ControllerAware. The outer
+// controller.Controller calls this on its Resource (us) before any background
+// goroutines start, so ServiceResource can observe HasInitialEventsProcessed
+// on it from pt-5's gating goroutine.
+func (t *ServiceResource) SetController(c *controller.Controller) {
+	t.outerController = c
+}
+
 // Run implements the controller.Backgrounder interface.
 func (t *ServiceResource) Run(ch <-chan struct{}) {
 	t.Log.Info("starting runner for endpoints")
 	// Register a controller for Endpoints which subsequently registers a
 	// controller for the Ingress resource.
-	(&controller.Controller{
+	t.endpointsController = &controller.Controller{
 		Resource: &serviceEndpointsResource{
 			Service: t,
 			Ctx:     t.Ctx,
@@ -329,7 +348,93 @@ func (t *ServiceResource) Run(ch <-chan struct{}) {
 			},
 		},
 		Log: t.Log.Named("controller/service"),
-	}).Run(ch)
+	}
+
+	// pt-5: gate the Syncer's reaper on both the outer (Service) and inner
+	// (EndpointSlice) controllers having processed their initial-LIST events.
+	// Without this gate, the very first Sync(rs) call from any Service Upsert
+	// closes the Syncer's initialSync channel; if the reaper polls before all
+	// other Service Upserts have been processed, those services won't be in
+	// serviceNames and the reaper schedules their entire existing Consul
+	// catalog for deregister.
+	//
+	// We only enable the gate if the Syncer supports it AND we have a
+	// reference to the outer Controller (set via SetController). Otherwise we
+	// fall back to the legacy behavior — the first Sync(rs) unblocks the
+	// reaper, same as before.
+	if gate, ok := t.Syncer.(InitialSyncGate); ok && t.outerController != nil {
+		gate.EnableInitialSyncGate()
+		go t.signalSyncerWhenInitialEventsProcessed(ch, gate)
+	}
+
+	t.endpointsController.Run(ch)
+}
+
+// signalSyncerWhenInitialEventsProcessed waits for both the outer and inner
+// controllers to report HasInitialEventsProcessed, then calls Ready() on the
+// Syncer to release the reaper. Runs in its own goroutine; exits early if the
+// stop channel closes.
+func (t *ServiceResource) signalSyncerWhenInitialEventsProcessed(
+	stopCh <-chan struct{},
+	gate InitialSyncGate,
+) {
+	// Wait for the outer Service controller to fully process its initial LIST.
+	// Once true, all Service Upserts have written into consulMap (gated by
+	// pt-4's wait inside Upsert, which ensures GetByIndex on the inner
+	// EndpointSlice cache was complete).
+	if !cache.WaitForCacheSync(stopCh, t.outerController.HasInitialEventsProcessed) {
+		t.Log.Info("stopped before outer controller reported initial events processed; not signaling syncer")
+		return
+	}
+	// Wait for the inner EndpointSlice controller likewise — by this point,
+	// every initial slice event has been drained (slice events whose parent
+	// Service was already tracked have updated endpointSlicesMap and pushed
+	// state via sync(); slice events whose parent wasn't tracked yet were
+	// silently dropped by shouldTrackEndpoints and will be handled by future
+	// WATCH events).
+	if t.endpointsController != nil {
+		if !cache.WaitForCacheSync(stopCh, t.endpointsController.HasInitialEventsProcessed) {
+			t.Log.Info("stopped before endpoints controller reported initial events processed; not signaling syncer")
+			return
+		}
+	}
+	t.Log.Info("both controllers have processed initial events; releasing syncer reaper")
+	gate.Ready()
+}
+
+// waitForEndpointsCacheSync blocks until the EndpointSlice informer's local
+// cache has completed its initial LIST, or the controller's context is
+// cancelled. Returns true on successful sync, false on context cancellation.
+//
+// This is called from Service Upsert before the informer index is queried to
+// build the per-service EndpointSlice set. See pt-4 for why this matters at
+// startup.
+func (t *ServiceResource) waitForEndpointsCacheSync() bool {
+	// In a normal startup, ServiceResource.Run constructs and starts
+	// endpointsController in a Backgrounder goroutine that begins before the
+	// outer Service controller's worker loop is allowed to run. By the time
+	// any Upsert fires, endpointsController is non-nil. The nil check here
+	// guards against an unlikely scheduler race during process boot.
+	if t.endpointsController == nil {
+		select {
+		case <-t.Ctx.Done():
+			return false
+		case <-time.After(100 * time.Millisecond):
+		}
+		if t.endpointsController == nil {
+			t.Log.Warn("endpoints controller not yet initialized; deferring upsert")
+			return false
+		}
+	}
+	if t.endpointsController.HasSynced() {
+		return true
+	}
+	t.Log.Info("waiting for endpoints informer cache to sync before processing service upsert")
+	if !cache.WaitForCacheSync(t.Ctx.Done(), t.endpointsController.HasSynced) {
+		return false
+	}
+	t.Log.Info("endpoints informer cache synced; resuming service upserts")
+	return true
 }
 
 // shouldSync returns true if resyncing should be enabled for the given service.
@@ -817,6 +922,74 @@ func (t *ServiceResource) registerServiceInstance(
 	}
 }
 
+// removeRegistrationsForSlice removes any registrations from
+// consulMap[svcKey] whose Service.ID was derived from an endpoint address
+// belonging to the supplied EndpointSlice. This is the pt-3 slice-scoped
+// alternative to calling generateRegistrations, which would otherwise rebuild
+// the entire service's registration set on every slice delete.
+//
+// Service IDs are computed via serviceID(consulServiceName, addr) for both
+// ClusterIP and NodePort registration paths. The consul service name may
+// differ from the K8s service name due to ConsulServicePrefix,
+// AddK8SNamespaceSuffix, or the consul.hashicorp.com/service-name annotation,
+// so we cannot reconstruct IDs from the K8s service name alone. Instead, we
+// read the consul service name from an existing registration in
+// consulMap[svcKey] (all entries for the same K8s service share the same
+// consul service name, derived once in generateRegistrations) and use that
+// to recompute the IDs to remove.
+//
+// Precondition: lock must be held.
+func (t *ServiceResource) removeRegistrationsForSlice(
+	svcKey string,
+	endpointSlice *discoveryv1.EndpointSlice,
+) {
+	regs, ok := t.consulMap[svcKey]
+	if !ok || len(regs) == 0 {
+		return
+	}
+
+	// Discover the consul service name from any existing registration. All
+	// registrations under svcKey are for the same K8s service and therefore
+	// share the same Service.Service value.
+	var consulName string
+	for _, r := range regs {
+		if r != nil && r.Service != nil && r.Service.Service != "" {
+			consulName = r.Service.Service
+			break
+		}
+	}
+	if consulName == "" {
+		return
+	}
+
+	removedIDs := make(map[string]struct{})
+	for _, ep := range endpointSlice.Endpoints {
+		for _, addr := range ep.Addresses {
+			removedIDs[serviceID(consulName, addr)] = struct{}{}
+		}
+	}
+	if len(removedIDs) == 0 {
+		return
+	}
+
+	kept := regs[:0]
+	for _, r := range regs {
+		if r == nil || r.Service == nil {
+			kept = append(kept, r)
+			continue
+		}
+		if _, drop := removedIDs[r.Service.ID]; drop {
+			continue
+		}
+		kept = append(kept, r)
+	}
+	if len(kept) == 0 {
+		delete(t.consulMap, svcKey)
+		return
+	}
+	t.consulMap[svcKey] = kept
+}
+
 // sync calls the Syncer.Sync function from the generated registrations.
 //
 // Precondition: lock must be held.
@@ -874,7 +1047,17 @@ func (t *serviceEndpointsResource) Informer() cache.SharedIndexInformer {
 		},
 		&discoveryv1.EndpointSlice{},
 		0,
-		cache.Indexers{},
+		cache.Indexers{
+			endpointServiceIndexName: func(obj interface{}) ([]string, error) {
+				endpointSlice := obj.(*discoveryv1.EndpointSlice)
+
+				if serviceName, ok := endpointSlice.Labels[discoveryv1.LabelServiceName]; ok {
+					return []string{endpointSlice.Namespace + "/" + serviceName}, nil
+				}
+
+				return nil, nil
+			},
+		},
 	)
 }
 
@@ -935,10 +1118,22 @@ func (t *serviceEndpointsResource) Delete(endptKey string, raw interface{}) erro
 	if _, ok := t.Service.endpointSlicesMap[svcKey]; ok {
 		if _, ok := t.Service.endpointSlicesMap[svcKey][endptKey]; ok {
 			delete(t.Service.endpointSlicesMap[svcKey], endptKey)
-			if _, ok := t.Service.consulMap[svcKey]; ok {
+
+			if len(t.Service.endpointSlicesMap[svcKey]) == 0 {
+				// Skip generating registrations if this was the last Endpoint
 				delete(t.Service.consulMap, svcKey)
-				t.Service.sync()
+			} else {
+				// pt-3: only drop registrations belonging to this slice instead of
+				// regenerating the entire service's registration set. For services
+				// with many endpoints (thousands) spread across many EndpointSlices,
+				// the full regeneration in pt-2 was O(total_endpoints) per slice
+				// event, producing large amounts of redundant work and triggering
+				// unnecessary deregister/re-register churn through the Syncer's
+				// reaper. This path is O(deleted_slice_endpoints).
+				t.Service.removeRegistrationsForSlice(svcKey, endpointSlice)
 			}
+
+			t.Service.sync()
 		}
 	}
 
